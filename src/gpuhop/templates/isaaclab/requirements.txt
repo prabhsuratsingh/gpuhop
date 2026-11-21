@@ -1,0 +1,4 @@
+# Loose top-level pins, used until `gpuhop freeze` writes requirements.lock.txt (commit that; from then on
+# every GPU installs exactly the lock). The base image already ships torch 2.7.0+cu128 and Python 3.11.
+--extra-index-url https://pypi.nvidia.com
+isaaclab[isaacsim,all]==2.3.2.post1

@@ -1,0 +1,44 @@
+# gpuhop project config for Isaac Lab (Isaac Sim 5.1 / Isaac Lab 2.3.2 / torch 2.7 cu128 / Python 3.11).
+project: __PROJECT__
+provider: vast
+
+code:
+  mode: tarball            # or `git` (clean pushed HEAD; needs GPUB_GH_TOKEN in .env)
+  exclude: ["logs/*", "outputs/*"]
+
+# Ubuntu 22.04 (GLIBC 2.35), Python 3.11, torch 2.7.0+cu128 preinstalled. The digest guard refuses to launch
+# if the tag ever points at a different image (comparable results across GPUs and months).
+image: pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
+image_digest: sha256:7db0e1bf4b1ac274ea09cf6358ab516f8a5c7d3d0e02311bed445f7e236a5d80
+disk_gb: 150               # Isaac Sim wheels + caches are ~40 GB installed
+python: python
+
+setup: setup.sh            # apt libs for headless Kit, Vulkan ICD, pip install Isaac Lab (~15-25 min)
+setup_hash_files: [requirements.txt, requirements.lock.txt]
+smoke: python smoke.py     # Isaac Sim boots headless and every task steps on the GPU
+bootstrap_timeout_min: 120
+
+env:
+  OMNI_KIT_ACCEPT_EULA: "Yes"
+  ACCEPT_EULA: "Y"
+  PRIVACY_CONSENT: "Y"
+  NVIDIA_DRIVER_CAPABILITIES: "all"   # graphics + compute driver libs: headless Kit (Vulkan) needs both
+  PYTHONUNBUFFERED: "1"
+
+search:
+  # the Isaac Sim pip wheels are ~15 GB: fast links only. Isaac Sim needs RT cores for rendering (videos);
+  # A100/H100 have none (physics-only jobs work, cameras do not).
+  base_query: "num_gpus=1 cuda_vers>=12.8 reliability>0.98 inet_down>=500 verified=true rentable=true geolocation notin [CN]"
+  # Isaac Sim 5.1 is validated on the 580 driver branch. Physics also runs on newer drivers, but the RTX renderer
+  # (cameras, videos) segfaulted at startup on 595.104 (createHydraEngine). Drop this if you never record video.
+  driver_regex: "^580\\."
+
+# gpus:
+#   rtx4090: {cpu_regex: "EPYC 9"}    # Isaac Lab stepping is partly CPU-bound: pin the host CPU class
+
+results:
+  remote_dir: results
+  local_dir: results
+  exclude: ["*.pt"]        # checkpoints stay on the box unless GPUB_PULL_CHECKPOINTS=1
+
+max_hours: 6

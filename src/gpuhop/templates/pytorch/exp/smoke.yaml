@@ -1,0 +1,6 @@
+# gpuhop exp rtx4090 exp/smoke.yaml   (~5 min including boot; a few cents)
+name: smoke
+timeout_min: 15
+jobs:
+  - name: fit
+    cmd: python train.py --steps 1000 --video

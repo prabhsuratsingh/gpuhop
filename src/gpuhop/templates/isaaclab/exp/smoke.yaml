@@ -1,0 +1,10 @@
+# gpuhop exp rtx4090 exp/smoke.yaml
+# Short PPO run on Cartpole, then a video of the trained policy (separate process, cameras on).
+name: smoke
+timeout_min: 30
+stop_on_fail: true
+jobs:
+  - name: ppo_cartpole
+    cmd: python train.py --task cartpole --seed 0 --max-iterations 150
+  - name: video
+    cmd: python record.py results/smoke/ppo_cartpole --steps 300

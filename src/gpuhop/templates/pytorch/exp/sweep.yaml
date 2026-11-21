@@ -1,0 +1,14 @@
+# A matrix: one job per (lr, seed) combination, run one at a time on the GPU.
+#   gpuhop exp rtx4090 exp/sweep.yaml
+# Placeholders: matrix keys, {exp}, {run_id}, {results}, {args}, {overrides}. Run ids: lr0.001_s0, ...
+name: sweep
+timeout_min: 30
+cmd: python train.py --lr {lr} --seed {seed} --steps 3000
+jobs:
+  - matrix:
+      lr: [0.003, 0.001, 0.0003]
+      seed: [0, 1]
+    name: "lr{lr}_s{seed}"
+  - name: best_with_video
+    cmd: python train.py --lr 0.001 --seed 0 --steps 3000 --video
+    allow_fail: true

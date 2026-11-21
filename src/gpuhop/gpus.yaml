@@ -1,0 +1,34 @@
+# Built-in GPU catalog. A project's gpuhop.yaml can override `search:` (these defaults) and `gpus:`
+# (add aliases, or change one alias's query / image / cpu_regex / driver_regex / env).
+#
+# `query` uses Vast search syntax (same as `vastai search offers`).
+#   cuda_vers>=12.8   the host driver must support the image's CUDA (12.8 for the default image)
+#   reliability       avoid flaky hosts mid-sweep
+#   inet_down         setup downloads are often many GB; slow links waste paid minutes
+#   verified=true     datacenter/verified hosts only
+# `disk_space>=<disk_gb>` is appended automatically.
+#
+# Offers are sorted by $/hr and the cheapest match is taken unless --offer is given.
+
+defaults:
+  base_query: "num_gpus=1 cuda_vers>=12.8 reliability>0.98 inet_down>=500 verified=true rentable=true geolocation notin [CN]"
+  cpu_regex: null
+  driver_regex: null   # e.g. "^580\.": pin the host NVIDIA driver branch (renderers can be picky)
+  env:
+    PYTHONUNBUFFERED: "1"
+
+gpus:
+  rtx4090:
+    query: "gpu_name=RTX_4090"
+  rtx5090:
+    query: "gpu_name=RTX_5090"
+  rtx3090:
+    query: "gpu_name=RTX_3090"
+  a100:
+    query: "gpu_name in [A100_SXM4,A100_PCIE]"
+  h100:
+    query: "gpu_name in [H100_SXM,H100_PCIE,H100_NVL]"
+  l40s:
+    query: "gpu_name=L40S"
+  l4:
+    query: "gpu_name=L4"

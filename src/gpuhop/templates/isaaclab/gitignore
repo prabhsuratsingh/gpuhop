@@ -1,0 +1,7 @@
+# gpuhop
+.env
+.gpuhop/
+results/**/*.pt
+__pycache__/
+logs/
+outputs/

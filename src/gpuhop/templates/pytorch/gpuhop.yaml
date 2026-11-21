@@ -1,0 +1,37 @@
+# gpuhop project config. Every key is optional except where noted; see `gpuhop --help`.
+project: __PROJECT__
+provider: vast
+
+# How code gets to the box:
+#   tarball  your working tree as it is (respecting .gitignore), no GitHub needed  [default]
+#   git      the box clones your pushed HEAD (clean tree required; needs GPUB_GH_TOKEN in .env)
+code:
+  mode: tarball
+  exclude: ["data/*", "*.ckpt"]   # extra patterns never shipped (on top of .gitignore)
+
+# Docker image the instance boots. torch is preinstalled here, so setup only adds the small extras.
+image: pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
+disk_gb: 40
+python: python
+
+# Runs once per instance (skipped on re-bootstrap when these files are unchanged).
+setup: setup.sh
+setup_hash_files: [requirements.txt]
+# Must pass before the instance counts as ready; writes its report to $GPUB_SMOKE_OUT (pulled as smoke.json).
+smoke: python smoke.py
+
+# Exported to every job (and to `gpuhop ssh`).
+env:
+  PYTHONUNBUFFERED: "1"
+
+# GPU aliases: the built-ins are rtx4090, rtx5090, rtx3090, a100, h100, l40s, l4. Add or override here, e.g.
+# gpus:
+#   rtx4090: {cpu_regex: "EPYC"}             # pin the host CPU class for fair comparisons
+#   a6000:   {query: "gpu_name=RTX_A6000"}
+
+results:
+  remote_dir: results       # jobs write under $GPUB_RESULTS = <project>/results/<exp>/<run_id>/ on the box
+  local_dir: results        # pulled to results/<gpu>/<exp>/<run_id>/
+  exclude: ["*.pt"]         # left on the box (GPUB_PULL_CHECKPOINTS=1 pulls them too)
+
+max_hours: 4                # `exp` watchdog: pull + destroy after this long

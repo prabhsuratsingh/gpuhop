@@ -1,0 +1,9 @@
+# Seeds x tasks with PPO; run ids like cartpole_s0, ant_s2.
+#   gpuhop exp rtx4090 exp/seeds.yaml
+name: seeds
+timeout_min: 60
+cmd: python train.py --task {task} --seed {seed}
+jobs:
+  - matrix:
+      task: [cartpole, ant]
+      seed: [0, 1, 2]

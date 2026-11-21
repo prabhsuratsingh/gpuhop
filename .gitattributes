@@ -1,0 +1,3 @@
+# Runtime scripts and templates run on Linux GPU boxes: force LF even when committed from Windows.
+* text=auto eol=lf
+*.png binary

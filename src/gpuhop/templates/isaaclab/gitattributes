@@ -1,0 +1,2 @@
+# Scripts run on Linux boxes: keep LF even when committed from Windows.
+*.sh text eol=lf
