@@ -14,18 +14,74 @@ from __future__ import annotations
 
 import os
 import posixpath
+import re
 import shlex
+import shutil
 import subprocess
 import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+
+def _local_parts(name: str) -> list[str] | None:
+    """A tar member's path as safe local path parts; None if it points outside the destination."""
+    if os.name == "nt":
+        name = name.replace("\\", "/")
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    parts = list(path.parts)
+    if os.name == "nt":  # characters NTFS rejects, or (":") silently turns into an alternate data stream
+        parts = [re.sub(r'[<>:"|?*\x00-\x1f]', "_", p).rstrip(" .") or "_" for p in parts]
+    return parts
+
+
+def safe_extract(tf: tarfile.TarFile, dest: Path) -> list[str]:
+    """Extract what a rented (untrusted) box sent, on every Python version: nothing lands outside `dest`, and links
+    are materialised as plain copies of their target inside the archive. Returns the members that were skipped."""
+    root = dest.resolve()
+    skipped = []
+    for m in tf:
+        parts = _local_parts(m.name)
+        if parts is None or not (m.isdir() or m.isreg() or m.islnk() or m.issym()):
+            skipped.append(m.name)
+            continue
+        if not parts:  # the archive root "."
+            continue
+        target = root.joinpath(*parts)
+        parent = target.parent.resolve()
+        if parent != root and root not in parent.parents:  # through a symlink already on disk
+            skipped.append(m.name)
+            continue
+        if m.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        try:
+            src = tf.extractfile(m)
+        except (KeyError, RecursionError, tarfile.TarError):  # dangling or self-referencing link
+            src = None
+        if src is None:  # includes a symlink to a directory, whose contents are in the archive anyway
+            if not m.isreg():
+                skipped.append(m.name)
+                continue
+            src = tf.extractfile(m)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
+            target.unlink()
+        with src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out)
+        if os.name != "nt":
+            os.chmod(target, (m.mode & 0o755) | 0o600)
+        if m.mtime:
+            os.utime(target, (m.mtime, m.mtime))
+    return skipped
 
 
 class Remote:
     def __init__(self, host: str, port: int, user: str = "root", key: str | None = None, ws: str = "/workspace",
                  known_hosts: Path | None = None):
         self.host, self.port, self.user = host, int(port), user
-        self.key = key
+        self.key = os.path.expanduser(key) if key else None
         self.ws = ws
         self.known_hosts = known_hosts
 
@@ -127,12 +183,16 @@ class Remote:
         fd, tmp_path = tempfile.mkstemp(suffix=".tgz")
         try:
             with os.fdopen(fd, "wb") as tmp:
-                p = subprocess.run(self.argv(f"tar -C {shlex.quote(remote_dir)} {excl} -czf - .", cwd=None),
+                # GNU tar exits 1 for "file changed as we read it": expected while a job is still writing
+                p = subprocess.run(self.argv(f"tar -C {shlex.quote(remote_dir)} --ignore-failed-read {excl} -czf - .; "
+                                             'rc=$?; [ "$rc" -eq 1 ] && exit 0; exit "$rc"', cwd=None),
                                    stdout=tmp, stderr=subprocess.PIPE, timeout=timeout)
             if p.returncode != 0:
                 raise RuntimeError(f"tar over ssh failed: {p.stderr.decode(errors='replace')[-1000:]}")
             with tarfile.open(tmp_path, "r:gz") as tf:
-                tf.extractall(local_dir, filter="data") if hasattr(tarfile, "data_filter") else tf.extractall(local_dir)
+                skipped = safe_extract(tf, local_dir)
+            if skipped:
+                print(f"  warning: skipped {len(skipped)} unsafe or dangling tar entries, e.g. {skipped[:3]}", flush=True)
         finally:
             os.unlink(tmp_path)
         return True

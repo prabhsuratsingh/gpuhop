@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import copy
 import os
+import posixpath
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,7 +41,14 @@ DEFAULTS: dict = {
 }
 
 # Secrets that must never be written to disk or printed.
-SECRET_KEYS = ("GH_TOKEN", "VAST_API_KEY", "GPUB_GH_TOKEN", "GPUBENCH_GH_TOKEN")
+SECRET_KEYS = re.compile(r"token|secret|passw|api_?key|private_?key|credential", re.IGNORECASE)
+
+_NESTED_KEYS = {
+    "code": {"mode", "exclude"},
+    "results": {"remote_dir", "local_dir", "exclude"},
+    "search": {"base_query", "cpu_regex", "driver_regex", "env"},
+}
+_GPU_KEYS = {"query", "image", "image_digest", "disk_gb", "cpu_regex", "driver_regex", "env"}
 
 
 def _merge(base: dict, over: dict) -> dict:
@@ -53,12 +62,25 @@ def validate(cfg: dict, source: str = CONFIG_NAME) -> dict:
     unknown = set(cfg) - set(DEFAULTS)
     if unknown:
         raise SystemExit(f"{source}: unknown key(s) {sorted(unknown)}; known: {sorted(DEFAULTS)}")
+    for section, known in _NESTED_KEYS.items():
+        if not isinstance(cfg[section], dict):
+            raise SystemExit(f"{source}: `{section}` must be a mapping, not {cfg[section]!r}")
+        bad = set(cfg[section]) - known
+        if bad:
+            raise SystemExit(f"{source}: unknown key(s) {sorted(bad)} in `{section}`; known: {sorted(known)}")
+    if not isinstance(cfg["gpus"], dict):
+        raise SystemExit(f"{source}: `gpus` must be a mapping, not {cfg['gpus']!r}")
+    for alias, gpu in cfg["gpus"].items():
+        bad = set(gpu or {}) - _GPU_KEYS
+        if bad:
+            raise SystemExit(f"{source}: unknown key(s) {sorted(bad)} in `gpus.{alias}`; known: {sorted(_GPU_KEYS)}")
     mode = cfg["code"].get("mode")
     if mode not in ("tarball", "git"):
         raise SystemExit(f"{source}: code.mode must be 'tarball' or 'git', not {mode!r}")
     for key in ("remote_dir", "local_dir"):
         p = str(cfg["results"][key])
-        if p.startswith(("/", "..")) or "\\" in p:
+        norm = posixpath.normpath(p)
+        if p.startswith("/") or "\\" in p or ":" in p or norm == "." or norm.split("/")[0] == "..":
             raise SystemExit(f"{source}: results.{key} must be a relative path inside the project, not {p!r}")
     return cfg
 
@@ -71,11 +93,16 @@ def env(name: str, default: str | None = None) -> str | None:
 def load_dotenv(path: Path):
     """Minimal .env support (KEY=VALUE lines) so secrets never need to be typed on the command line."""
     if path.exists():
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+                k, v = k.strip().removeprefix("export ").strip(), v.strip()
+                if v and v[0] in "'\"" and v.find(v[0], 1) > 0:  # quoted: everything between the quotes
+                    v = v[1:v.find(v[0], 1)]
+                else:  # unquoted: a " #" starts a comment
+                    v = re.split(r"\s+#", v, maxsplit=1)[0].strip()
+                os.environ.setdefault(k, v)
 
 
 @dataclass
@@ -106,7 +133,7 @@ def find_root(start: Path | None = None) -> Path:
 
 def load(start: Path | None = None) -> Project:
     root = find_root(start)
-    raw = yaml.safe_load((root / CONFIG_NAME).read_text()) or {}
+    raw = yaml.safe_load((root / CONFIG_NAME).read_text(encoding="utf-8-sig")) or {}
     if not isinstance(raw, dict):
         raise SystemExit(f"{root / CONFIG_NAME}: expected a mapping at the top level")
     cfg = validate(_merge(DEFAULTS, raw), str(root / CONFIG_NAME))
@@ -116,7 +143,7 @@ def load(start: Path | None = None) -> Project:
 
 def redact(d):
     if isinstance(d, dict):
-        return {k: ("***" if k in SECRET_KEYS else redact(v)) for k, v in d.items()}
+        return {k: ("***" if SECRET_KEYS.search(str(k)) else redact(v)) for k, v in d.items()}
     if isinstance(d, list):
         return [redact(v) for v in d]
     return d

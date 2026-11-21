@@ -12,7 +12,7 @@ from .project import Project, _merge
 
 
 def builtin() -> dict:
-    return yaml.safe_load(resources.files("gpuhop").joinpath("gpus.yaml").read_text())
+    return yaml.safe_load(resources.files("gpuhop").joinpath("gpus.yaml").read_text(encoding="utf-8"))
 
 
 def catalog(proj: Project) -> dict:

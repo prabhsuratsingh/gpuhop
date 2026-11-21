@@ -58,7 +58,7 @@ class VastProvider(Provider):
         drv = spec.get("driver_regex")
         offers = self.client.search_offers(query=spec["query"], order="dph", limit=limit * (10 if cpu or drv else 3),
                                            storage=spec["disk_gb"])
-        offers = sorted(offers or [], key=lambda o: o.get("dph_total", 1e9))
+        offers = sorted(offers or [], key=lambda o: o.get("dph_total") or 1e9)
         if cpu:
             offers = [o for o in offers if re.search(cpu, o.get("cpu_name") or "", re.IGNORECASE)]
         if drv:
@@ -75,7 +75,12 @@ class VastProvider(Provider):
         return int(res["new_contract"])
 
     def show(self, inst_id: int) -> dict | None:
-        r = self.client.show_instance(id=inst_id)
+        try:
+            r = self.client.show_instance(id=inst_id)
+        except Exception as e:
+            if getattr(getattr(e, "response", None), "status_code", None) == 404:  # really gone, not an API hiccup
+                return None
+            raise
         if isinstance(r, dict) and "instances" in r:  # some API versions wrap the object
             r = r["instances"]
         return self._inst(r) if r else None
@@ -84,7 +89,9 @@ class VastProvider(Provider):
         return [self._inst(r) for r in (self.client.show_instances() or [])]
 
     def destroy(self, inst_id: int):
-        self.client.destroy_instance(id=inst_id)
+        res = self.client.destroy_instance(id=inst_id)
+        if isinstance(res, dict) and res.get("success") is False:
+            raise RuntimeError(f"destroy_instance {inst_id} failed: {res.get('msg') or res.get('error') or res}")
 
     def start(self, inst_id: int):
         return self.client.start_instance(id=inst_id)

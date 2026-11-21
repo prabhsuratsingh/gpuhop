@@ -15,12 +15,13 @@ pytestmark = needs_bash
 
 def make_project(root, setup_ok=True, smoke=True):
     root.mkdir(parents=True, exist_ok=True)
+    smoke_cmd = """'"$GPUB_PYTHON" smoke.py'""" if smoke else "null"  # quoted: the interpreter path may have spaces
     (root / "gpuhop.yaml").write_text(textwrap.dedent(f"""\
         project: e2e
         python: "{PY}"
         setup: setup.sh
         setup_hash_files: [requirements.txt]
-        smoke: {'"$GPUB_PYTHON smoke.py"' if smoke else 'null'}
+        smoke: {smoke_cmd}
         env: {{MY_VAR: "hello world"}}
         bootstrap_timeout_min: 2
         """))
@@ -43,14 +44,14 @@ def make_project(root, setup_ok=True, smoke=True):
     (root / "exp").mkdir(exist_ok=True)
     (root / "exp" / "e1.yaml").write_text(textwrap.dedent("""\
         name: e1
-        cmd: $GPUB_PYTHON job.py {arg}
+        cmd: '"$GPUB_PYTHON" job.py {arg}'
         jobs:
           - matrix: {arg: [a, b]}
           - name: flaky
-            cmd: $GPUB_PYTHON job.py bad
+            cmd: '"$GPUB_PYTHON" job.py bad'
             allow_fail: true
         """))
-    (root / "exp" / "e2.yaml").write_text("name: e2\njobs: [{name: hard_fail, cmd: '$GPUB_PYTHON job.py bad'}]\n")
+    (root / "exp" / "e2.yaml").write_text("name: e2\njobs: [{name: hard_fail, cmd: '\"$GPUB_PYTHON\" job.py bad'}]\n")
     return project.load(root)
 
 

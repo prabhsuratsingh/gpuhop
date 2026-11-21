@@ -36,6 +36,7 @@ import yaml
 _KEYS = {"name", "timeout_min", "cmd", "stop_on_fail", "stop_session_on_fail", "jobs"}
 _ENTRY_KEYS = {"name", "cmd", "matrix", "overrides", "timeout_min", "allow_fail"}
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._=-]+")
+_RESERVED = {"exp", "run_id", "results", "args", "overrides"}
 
 
 def _fmt(v) -> str:
@@ -59,20 +60,22 @@ def expand(exp_path: str | Path, remote_dir: str = "results") -> dict:
     exp_path = Path(exp_path)
     if not exp_path.exists():
         raise SystemExit(f"experiment file not found: {exp_path}")
-    spec = yaml.safe_load(exp_path.read_text()) or {}
+    spec = yaml.safe_load(exp_path.read_text(encoding="utf-8-sig")) or {}
     unknown = set(spec) - _KEYS
     if unknown:
         raise ValueError(f"{exp_path}: unknown key(s) {sorted(unknown)}; known: {sorted(_KEYS)}")
     if not spec.get("jobs"):
         raise ValueError(f"{exp_path}: no `jobs:`")
     name = str(spec.get("name", exp_path.stem))
-    if _SAFE_ID.search(name):
+    if _SAFE_ID.search(name) or name in (".", ".."):
         raise ValueError(f"{exp_path}: experiment name {name!r} may only contain letters, digits and . _ = -")
     default_timeout = int(spec.get("timeout_min", 120))
     jobs = []
 
     def add(run_id: str, cmd_t: str, values: dict, entry: dict, where: str):
         run_id = _SAFE_ID.sub("-", run_id)
+        if run_id in (".", ".."):
+            raise ValueError(f"{where}: job name {run_id!r} would escape the experiment's results dir")
         results = posixpath.join(remote_dir, name, run_id)
         values = {**values, "exp": name, "run_id": run_id, "results": results}
         jobs.append({"name": run_id, "cmd": _render(cmd_t, values, where), "results": results,
@@ -93,8 +96,13 @@ def expand(exp_path: str | Path, remote_dir: str = "results") -> dict:
         if not cmd_t:
             raise ValueError(f"{where}: matrix entry has no `cmd` (and the file has no top-level `cmd`)")
         matrix = entry["matrix"]
-        keys = list(matrix)
+        keys = list(matrix or {})
+        reserved = sorted(set(keys) & _RESERVED)
+        if reserved:
+            raise ValueError(f"{where}: matrix key(s) {reserved} clash with built-in placeholders; rename them")
         combos = list(itertools.product(*(matrix[k] if isinstance(matrix[k], list) else [matrix[k]] for k in keys)))
+        if not keys or not combos:
+            raise ValueError(f"{where}: the matrix is empty, so it would run no jobs")
         ov = " ".join(shlex.quote(f"{k}={_fmt(v)}") for k, v in (entry.get("overrides") or {}).items())
         for combo in combos:
             params = dict(zip(keys, combo))

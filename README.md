@@ -27,8 +27,12 @@ for each experiment file:  run its jobs one at a time (detached in tmux; survive
 final pull -> destroy
 ```
 
-A stopped instance whose results could not be pulled is **never** destroyed automatically. gpuhop prints
-the commands to recover it instead.
+An instance whose results could not be pulled is **never** destroyed automatically. gpuhop prints the commands
+to recover it instead, and it may keep billing until you run them. During the final pull, pressing Ctrl-C twice
+abandons the results and destroys the instance.
+
+The `max_hours` watchdog runs in the `gpuhop` process on your laptop. If that process dies (power loss, closed
+terminal), nothing destroys the instance: check `gpuhop ls` and run `gpuhop down`.
 
 ## Templates
 
@@ -63,6 +67,7 @@ results: {remote_dir: results, local_dir: results, exclude: ["*.pt"]}
 lockfile: requirements.lock.txt # written by `gpuhop freeze`
 max_hours: 12                   # `exp` watchdog: pull + destroy after this long
 bootstrap_timeout_min: 90
+image_pull_timeout_min: 10      # give up on a host still pulling the image after this long (next offer)
 require_git_tag: null           # warn if `exp` runs from anything other than this tag (code freeze)
 ```
 
@@ -109,7 +114,11 @@ Every job runs from the project dir and sees these variables:
 - `$GIT_SHA`
 - everything under `env:`
 
-Jobs run strictly one at a time. Two jobs sharing one GPU would distort every timing they report.
+Jobs run strictly one at a time. Two jobs sharing one GPU would distort every timing they report, so `run`
+refuses to start an experiment while another one is running on the instance.
+
+Rerunning an experiment skips jobs that already succeeded, unless their command or the pushed code changed. If
+the job runner dies (host restart, out of memory), `exp` restarts it and resumes.
 
 ## Where things end up
 
