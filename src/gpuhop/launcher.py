@@ -43,12 +43,21 @@ class RunnerDied(RuntimeError):
     """The job runner stopped without finishing (host restart, OOM kill, ...)."""
 
 
+class FailsafeError(Exception):
+    """The provider refused the failsafe stop. An account problem, not a host problem: do not try other offers."""
+
+
+def _utc(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
+
+
 class Launcher:
     poll_running_s = 15
     poll_ready_s = 30
     poll_exp_s = 60
     poll_offer_s = 60
     runner_stale_s = 120  # no heartbeat for this long = the job runner is dead
+    failsafe_grace_s = 15 * 60  # after the max_hours deadline: time for the launcher's own pull + destroy
     shell = "bash"  # on the box
 
     def __init__(self, proj: Project, provider: Provider | None = None):
@@ -115,8 +124,32 @@ class Launcher:
     def gpu_alias(self, inst_id: int, inst: dict | None = None) -> str:
         return self.state.get(inst_id).get("gpu") or "unknown"
 
+    def arm_failsafe(self, inst_id: int, at: float):
+        """Have the provider stop the instance after `at` even if this process (or the laptop) is gone. A stop, not a
+        destroy: results stay on the disk; GPU billing ends, storage billing continues."""
+        if env("NO_FAILSAFE") == "1":
+            print(f"WARNING: GPUB_NO_FAILSAFE=1: nothing stops instance {inst_id} if this laptop goes away")
+            return
+        job = self.provider.schedule_stop(inst_id, at)
+        if job is None:
+            print(f"note: {self.provider.name} cannot schedule a server-side stop; if this laptop goes away, nothing "
+                  f"stops instance {inst_id}")
+            return
+        self.state.remember(inst_id, failsafe_at=at, failsafe_job=job)
+        print(f"failsafe: if instance {inst_id} is still up after {_utc(at)}, {self.provider.name} stops it "
+              "(at the next full UTC hour)", flush=True)
+
+    def disarm_failsafe(self, inst_id: int):
+        try:
+            self.provider.cancel_scheduled_stops(inst_id)
+            if self.state.get(inst_id):
+                self.state.remember(inst_id, failsafe_at=None, failsafe_job=None)
+        except Exception as e:
+            print(f"warning: could not delete the scheduled stop of instance {inst_id} ({e}); `gpuhop ls` retries")
+
     def destroy(self, inst_id: int):
         self.provider.destroy(inst_id)
+        self.disarm_failsafe(inst_id)  # after the destroy: if that fails, the failsafe must stay armed
         s = self.state.get(inst_id)
         if s.get("created") and s.get("dph"):
             hrs = (time.time() - s["created"]) / 3600
@@ -227,7 +260,8 @@ class Launcher:
 
     # ---------------------------------------------------------------------------------------------- up
     def up(self, gpu: str, offer_id: int | None = None, allow_dirty: bool = False, wait: bool = True,
-           created: list | None = None, offer: dict | None = None) -> tuple[int, dict, Remote]:
+           created: list | None = None, offer: dict | None = None,
+           failsafe_at: float | None = None) -> tuple[int, dict, Remote]:
         """Create + bootstrap. The new id is appended to `created` immediately, so callers can always clean up.
 
         An instance that never becomes reachable (never `running`, or ssh never answers) is useless and is
@@ -257,6 +291,15 @@ class Launcher:
         price = offer.get("dph")
         print(f"created instance {inst_id} on offer {offer['id']} ({f'${price:.3f}' if price else 'price on start'}/hr); "
               f"code: {code.describe()}", flush=True)
+        if failsafe_at is not None:  # armed before anything else can go wrong (or the laptop can go away)
+            try:
+                self.arm_failsafe(inst_id, failsafe_at)
+            except Exception as e:
+                print(f"could not schedule the failsafe stop for instance {inst_id} ({e}); destroying it. "
+                      "Set GPUB_NO_FAILSAFE=1 to run without it.", flush=True)
+                if self._destroy_safely(inst_id) and created is not None:
+                    created.remove(inst_id)
+                raise FailsafeError(f"failsafe stop could not be scheduled: {e}") from e
         try:
             inst = self.wait_running(inst_id)
             rem = self.connect(inst_id, inst)
@@ -287,10 +330,10 @@ class Launcher:
             time.sleep(self.poll_offer_s)
 
     def up_with_retry(self, gpu: str, offer_id: int | None, allow_dirty: bool, created: list, attempts: int = 3,
-                      wait: bool = True):
+                      wait: bool = True, failsafe_at: float | None = None):
         """`up`, moving on to the next-cheapest offer when a host never starts its container."""
         if offer_id is not None:
-            return self.up(gpu, offer_id, allow_dirty, wait=wait, created=created)
+            return self.up(gpu, offer_id, allow_dirty, wait=wait, created=created, failsafe_at=failsafe_at)
         wait_min = float(env("WAIT_OFFER_MIN") or 0)
         tried: set = set()
         last_err = None
@@ -307,7 +350,8 @@ class Launcher:
             tried.add(cands[0]["id"])
             n_before = len(created)
             try:
-                return self.up(gpu, cands[0]["id"], allow_dirty, wait=wait, created=created, offer=cands[0])
+                return self.up(gpu, cands[0]["id"], allow_dirty, wait=wait, created=created, offer=cands[0],
+                               failsafe_at=failsafe_at)
             except (RuntimeError, TimeoutError) as e:
                 if len(created) > n_before:  # reachable but failed later (bootstrap): not a host problem
                     raise
@@ -511,7 +555,8 @@ class Launcher:
             if instance:
                 inst_id, inst, rem = self.get(instance)
             else:
-                inst_id, inst, rem = self.up_with_retry(gpu, offer_id, allow_dirty, created)
+                inst_id, inst, rem = self.up_with_retry(  # a kept instance is meant to outlive the session
+                    gpu, offer_id, allow_dirty, created, failsafe_at=None if keep else deadline + self.failsafe_grace_s)
             sha = self.state.get(inst_id).get("git_sha")
             failed = False
             for f in exp_files:
@@ -627,8 +672,11 @@ class Launcher:
         steps = (f"  1) gpuhop pull {inst_id}    2) gpuhop down {inst_id} -y" if state == "running" else
                  f"  1) gpuhop start {inst_id}   2) gpuhop wait {inst_id}\n"
                  f"  3) gpuhop pull {inst_id}    4) gpuhop down {inst_id} -y")
+        armed = self.state.get(inst_id).get("failsafe_at")
+        note = (f" The failsafe stops it after {_utc(armed)} (GPU billing ends then; storage continues)." if armed
+                else "")
         print(f"NOT destroying instance {inst_id}: it is '{state}' and its results could not be pulled. "
-              f"IT MAY STILL BE BILLING.\n{steps}", flush=True)
+              f"IT MAY STILL BE BILLING.{note}\n{steps}", flush=True)
         return False
 
     def smoke(self, gpu: str, offer_id=None, allow_dirty=False, keep=False) -> int:
@@ -636,7 +684,8 @@ class Launcher:
         created: list = []
         code = 1
         try:
-            inst_id, inst, rem = self.up_with_retry(gpu, offer_id, allow_dirty, created)
+            failsafe_at = None if keep else time.time() + float(self.proj.cfg["max_hours"]) * 3600 + self.failsafe_grace_s
+            inst_id, inst, rem = self.up_with_retry(gpu, offer_id, allow_dirty, created, failsafe_at=failsafe_at)
             meta = self.pull(inst_id, inst, rem) / "_instance" / str(inst_id)
             print((meta / "smoke.json").read_text(encoding="utf-8", errors="replace") if (meta / "smoke.json").exists()
                   else "bootstrap OK (no smoke report)")

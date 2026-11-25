@@ -84,6 +84,27 @@ class FakeProvider(Provider):
     def start(self, inst_id):
         self.instances[inst_id]["status"] = "running"
 
+    # like Vast: jobs are not deleted with their instance
+    jobs: dict
+    fail_schedule = None  # an exception to raise from schedule_stop
+
+    def schedule_stop(self, inst_id, at):
+        if self.fail_schedule:
+            raise self.fail_schedule
+        self.jobs = getattr(self, "jobs", {})
+        job_id = 9000 + len(self.jobs) + 1
+        self.jobs[job_id] = {"id": job_id, "instance_id": inst_id, "start_time": int(at)}
+        return job_id
+
+    def scheduled_stops(self):
+        return list(getattr(self, "jobs", {}).values())
+
+    def cancel_scheduled_stops(self, inst_id):
+        mine = [k for k, j in getattr(self, "jobs", {}).items() if j["instance_id"] == inst_id]
+        for k in mine:
+            del self.jobs[k]
+        return len(mine)
+
 
 class LocalRemote(Remote):
     """Remote whose "box" is a local directory; commands run in Git Bash / bash instead of over ssh."""

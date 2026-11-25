@@ -31,8 +31,13 @@ An instance whose results could not be pulled is **never** destroyed automatical
 to recover it instead, and it may keep billing until you run them. During the final pull, pressing Ctrl-C twice
 abandons the results and destroys the instance.
 
-The `max_hours` watchdog runs in the `gpuhop` process on your laptop. If that process dies (power loss, closed
-terminal), nothing destroys the instance: check `gpuhop ls` and run `gpuhop down`.
+The `max_hours` watchdog runs in the `gpuhop` process on your laptop, so `exp` and `smoke` also arm a
+**failsafe** right after renting: a job on Vast's own servers that stops the instance if it is still up 15 minutes
+after the deadline. It works even if your laptop dies. Vast runs it at the next full UTC hour, so the worst case is
+about one extra hour of GPU time, then storage only (a stop keeps the results on the disk). `gpuhop ls` marks an
+instance the failsafe stopped; recover it with `gpuhop start`, `wait`, `pull`, then `down`. If Vast refuses the
+failsafe, `exp` destroys the new instance and stops; set `GPUB_NO_FAILSAFE=1` to run without it. Instances you keep
+(`--keep`, `--instance`, `up`) get no failsafe.
 
 ## Templates
 

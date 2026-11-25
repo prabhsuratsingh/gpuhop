@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 
@@ -95,6 +96,58 @@ class VastProvider(Provider):
 
     def start(self, inst_id: int):
         return self.client.start_instance(id=inst_id)
+
+    # -- failsafe ----------------------------------------------------------------------------------------
+    # Vast runs scheduled jobs server-side at the top of each UTC hour between start_time and end_time (measured
+    # live: a job created at 07:25 UTC stopped its instance at 08:00 UTC). Jobs outlive their instance, so
+    # callers must cancel them.
+    STOP_REPEAT_S = 24 * 3600  # keep re-stopping for a day, in case something restarts the instance
+
+    @staticmethod
+    def _stop_endpoint(inst_id) -> str:
+        return f"/api/v0/instances/{int(inst_id)}/"
+
+    def schedule_stop(self, inst_id: int, at: float) -> int:
+        # Vast fires at the top of the hour that *contains* start_time (seen live: 10:13 fired at 10:00), so round
+        # up to the next full hour or the stop could hit a healthy session up to 59 min early. Ints only: the API
+        # rejects fractional timestamps.
+        start = -(-int(at) // 3600) * 3600
+        job = dict(start_time=start, end_time=start + self.STOP_REPEAT_S, api_endpoint=self._stop_endpoint(inst_id),
+                   request_method="PUT", request_body={"state": "stopped", "instance_id": int(inst_id)},
+                   frequency="HOURLY", instance_id=int(inst_id))
+        try:
+            res = self.client.create_scheduled_job(**job)
+        except Exception as e:
+            if getattr(getattr(e, "response", None), "status_code", None) != 422:  # 422: a job exists already
+                raise
+            self.cancel_scheduled_stops(inst_id)
+            res = self.client.create_scheduled_job(**job)
+        if not isinstance(res, dict) or res.get("success") is False or "scheduled_job_id" not in res:
+            raise RuntimeError(f"create_scheduled_job failed: {res}")
+        return int(res["scheduled_job_id"])
+
+    def scheduled_stops(self) -> list[dict]:
+        out = []
+        for j in self.client.show_scheduled_jobs() or []:
+            body = j.get("request_body") or {}
+            if isinstance(body, str):
+                try:
+                    body = json.loads(body)
+                except ValueError:
+                    body = {}
+            iid = j.get("instance_id")
+            if (iid is not None and str(j.get("request_method")).upper() == "PUT" and body.get("state") == "stopped"
+                    and j.get("api_endpoint") == self._stop_endpoint(iid)):
+                out.append({"id": j["id"], "instance_id": int(iid), "start_time": j.get("start_time")})
+        return out
+
+    def cancel_scheduled_stops(self, inst_id: int) -> int:
+        n = 0
+        for j in self.scheduled_stops():
+            if j["instance_id"] == int(inst_id):
+                self.client.delete_scheduled_job(id=j["id"])
+                n += 1
+        return n
 
     def logs(self, inst_id: int, tail: int = 100) -> str:
         return str(self.client.logs(instance_id=inst_id, tail=str(tail)))

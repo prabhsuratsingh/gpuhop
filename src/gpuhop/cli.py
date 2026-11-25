@@ -182,6 +182,9 @@ def cmd_ls(a):
     for r in rows:
         age = (time.time() - (r.get("start_date") or time.time())) / 3600
         tag = "this project" if str(r["id"]) in local else "other"
+        armed = (local.get(str(r["id"])) or {}).get("failsafe_at")
+        if armed and time.time() > armed and r["status"] != "running":
+            tag += f"; stopped by the failsafe, results may be on its disk: gpuhop start {r['id']}, wait, pull, down"
         print(f"{r['id']:>10}  {r['gpu_name'] or '?':<12} {r['status']:<9} ${r['dph'] or 0:.3f}/hr  {age:5.2f} h  "
               f"~${age * (r['dph'] or 0):.2f}  label={r.get('label')}  [{tag}]")
     for s in set(local) - {str(r["id"]) for r in rows}:
@@ -190,7 +193,24 @@ def cmd_ls(a):
                 lx.state.forget(int(s))
         except Exception as e:
             print(f"could not check instance {s}: {e}")
+    _clean_scheduled_stops(lx, {r["id"] for r in rows})
     return 0
+
+
+def _clean_scheduled_stops(lx, listed: set):
+    """Scheduled stops outlive their instance (Vast keeps them): delete the ones whose instance is gone."""
+    try:
+        stops = lx.provider.scheduled_stops()
+    except Exception as e:
+        print(f"could not list scheduled stops: {e}")
+        return
+    for iid in sorted({j["instance_id"] for j in stops} - {int(i) for i in listed}):
+        try:
+            if lx.provider.show(iid) is None:
+                lx.provider.cancel_scheduled_stops(iid)
+                print(f"deleted the leftover scheduled stop of destroyed instance {iid}")
+        except Exception as e:
+            print(f"could not clean the scheduled stop of instance {iid}: {e}")
 
 
 def cmd_show(a):
@@ -237,6 +257,7 @@ def cmd_rebootstrap(a):
 def cmd_start(a):
     lx = _launcher()
     inst_id = lx.state.resolve(a.id)
+    lx.disarm_failsafe(inst_id)  # otherwise the scheduled stop stops it again at the next full hour
     print(lx.provider.start(inst_id))
     print(f"starting {inst_id}; then: gpuhop wait {inst_id}")
     return 0
