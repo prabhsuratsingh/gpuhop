@@ -9,9 +9,12 @@ fake provider and a local "remote").
 from __future__ import annotations
 
 import json
+import posixpath
 import shlex
+import signal
 import subprocess
 import time
+import uuid
 from importlib import resources
 from pathlib import Path
 
@@ -36,17 +39,32 @@ mkdir -p /workspace/.gpuhop
 _COMPAT = ("GPU", "DPH", "OFFER_ID", "IMAGE", "HOST_CPU")
 
 
+class RunnerDied(RuntimeError):
+    """The job runner stopped without finishing (host restart, OOM kill, ...)."""
+
+
+class FailsafeError(Exception):
+    """The provider refused the failsafe stop. An account problem, not a host problem: do not try other offers."""
+
+
+def _utc(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
+
+
 class Launcher:
     poll_running_s = 15
     poll_ready_s = 30
     poll_exp_s = 60
     poll_offer_s = 60
+    runner_stale_s = 120  # no heartbeat for this long = the job runner is dead
+    failsafe_grace_s = 15 * 60  # after the max_hours deadline: time for the launcher's own pull + destroy
     shell = "bash"  # on the box
 
     def __init__(self, proj: Project, provider: Provider | None = None):
         self.proj = proj
         self.provider = provider or get_provider(proj.cfg["provider"])
         self.state = State(proj)
+        self._tokens: dict[str, str] = {}  # exp -> id of the runner this process started
 
     # ---------------------------------------------------------------------------------------------- basics
     def _remote_at(self, host: str, port: int) -> Remote:
@@ -106,8 +124,32 @@ class Launcher:
     def gpu_alias(self, inst_id: int, inst: dict | None = None) -> str:
         return self.state.get(inst_id).get("gpu") or "unknown"
 
+    def arm_failsafe(self, inst_id: int, at: float):
+        """Have the provider stop the instance after `at` even if this process (or the laptop) is gone. A stop, not a
+        destroy: results stay on the disk; GPU billing ends, storage billing continues."""
+        if env("NO_FAILSAFE") == "1":
+            print(f"WARNING: GPUB_NO_FAILSAFE=1: nothing stops instance {inst_id} if this laptop goes away")
+            return
+        job = self.provider.schedule_stop(inst_id, at)
+        if job is None:
+            print(f"note: {self.provider.name} cannot schedule a server-side stop; if this laptop goes away, nothing "
+                  f"stops instance {inst_id}")
+            return
+        self.state.remember(inst_id, failsafe_at=at, failsafe_job=job)
+        print(f"failsafe: if instance {inst_id} is still up after {_utc(at)}, {self.provider.name} stops it "
+              "(at the next full UTC hour)", flush=True)
+
+    def disarm_failsafe(self, inst_id: int):
+        try:
+            self.provider.cancel_scheduled_stops(inst_id)
+            if self.state.get(inst_id):
+                self.state.remember(inst_id, failsafe_at=None, failsafe_job=None)
+        except Exception as e:
+            print(f"warning: could not delete the scheduled stop of instance {inst_id} ({e}); `gpuhop ls` retries")
+
     def destroy(self, inst_id: int):
         self.provider.destroy(inst_id)
+        self.disarm_failsafe(inst_id)  # after the destroy: if that fails, the failsafe must stay armed
         s = self.state.get(inst_id)
         if s.get("created") and s.get("dph"):
             hrs = (time.time() - s["created"]) / 3600
@@ -152,9 +194,11 @@ class Launcher:
         rem.detach("bootstrap", f"bash {q(rem.rt + '/bootstrap.sh')}", f"{rem.ws}/bootstrap.log")
 
     # ---------------------------------------------------------------------------------------------- waiting
-    def wait_running(self, inst_id: int, timeout_s: int = 1800, stuck_created_s: int = 600) -> dict:
+    def wait_running(self, inst_id: int, timeout_s: int = 1800, stuck_created_s: int = 600,
+                     restarting: bool = False) -> dict:
         """Wait for status=running. A host still loading (pulling the image) after image_pull_timeout_min is given
-        up on: in practice such hosts rarely finish, and some bill while they try."""
+        up on: in practice such hosts rarely finish, and some bill while they try. With `restarting`, an instance
+        that was just asked to start may still report its old stopped status."""
         t0 = time.time()
         last = None
         created_since = None
@@ -179,7 +223,8 @@ class Launcher:
                 if inst.get("dph"):
                     self.state.remember(inst_id, dph=inst["dph"])
                 return inst
-            if status in ("exited", "offline") or "error" in msg.lower():
+            starting = restarting and inst.get("intended_status") == "running"
+            if not starting and (status in ("exited", "offline") or "error" in msg.lower()):
                 raise RuntimeError(f"instance {inst_id} failed to start: status={status} msg={msg}")
             time.sleep(self.poll_running_s)
         raise TimeoutError(f"instance {inst_id} not running after {timeout_s}s")
@@ -215,7 +260,8 @@ class Launcher:
 
     # ---------------------------------------------------------------------------------------------- up
     def up(self, gpu: str, offer_id: int | None = None, allow_dirty: bool = False, wait: bool = True,
-           created: list | None = None, offer: dict | None = None) -> tuple[int, dict, Remote]:
+           created: list | None = None, offer: dict | None = None,
+           failsafe_at: float | None = None) -> tuple[int, dict, Remote]:
         """Create + bootstrap. The new id is appended to `created` immediately, so callers can always clean up.
 
         An instance that never becomes reachable (never `running`, or ssh never answers) is useless and is
@@ -245,13 +291,21 @@ class Launcher:
         price = offer.get("dph")
         print(f"created instance {inst_id} on offer {offer['id']} ({f'${price:.3f}' if price else 'price on start'}/hr); "
               f"code: {code.describe()}", flush=True)
+        if failsafe_at is not None:  # armed before anything else can go wrong (or the laptop can go away)
+            try:
+                self.arm_failsafe(inst_id, failsafe_at)
+            except Exception as e:
+                print(f"could not schedule the failsafe stop for instance {inst_id} ({e}); destroying it. "
+                      "Set GPUB_NO_FAILSAFE=1 to run without it.", flush=True)
+                if self._destroy_safely(inst_id) and created is not None:
+                    created.remove(inst_id)
+                raise FailsafeError(f"failsafe stop could not be scheduled: {e}") from e
         try:
             inst = self.wait_running(inst_id)
             rem = self.connect(inst_id, inst)
         except BaseException:
             print(f"instance {inst_id} never became reachable; destroying it")
-            self.destroy(inst_id)
-            if created is not None:
+            if self._destroy_safely(inst_id) and created is not None:
                 created.remove(inst_id)
             raise
         self.write_env(rem, inst_id, inst)
@@ -275,10 +329,11 @@ class Launcher:
                   f"checking again in {self.poll_offer_s} s ({max(0, deadline - time.time()) / 60:.0f} min left)", flush=True)
             time.sleep(self.poll_offer_s)
 
-    def up_with_retry(self, gpu: str, offer_id: int | None, allow_dirty: bool, created: list, attempts: int = 3):
+    def up_with_retry(self, gpu: str, offer_id: int | None, allow_dirty: bool, created: list, attempts: int = 3,
+                      wait: bool = True, failsafe_at: float | None = None):
         """`up`, moving on to the next-cheapest offer when a host never starts its container."""
         if offer_id is not None:
-            return self.up(gpu, offer_id, allow_dirty, created=created)
+            return self.up(gpu, offer_id, allow_dirty, wait=wait, created=created, failsafe_at=failsafe_at)
         wait_min = float(env("WAIT_OFFER_MIN") or 0)
         tried: set = set()
         last_err = None
@@ -295,7 +350,8 @@ class Launcher:
             tried.add(cands[0]["id"])
             n_before = len(created)
             try:
-                return self.up(gpu, cands[0]["id"], allow_dirty, created=created, offer=cands[0])
+                return self.up(gpu, cands[0]["id"], allow_dirty, wait=wait, created=created, offer=cands[0],
+                               failsafe_at=failsafe_at)
             except (RuntimeError, TimeoutError) as e:
                 if len(created) > n_before:  # reachable but failed later (bootstrap): not a host problem
                     raise
@@ -324,11 +380,39 @@ class Launcher:
         return 0
 
     # ---------------------------------------------------------------------------------------------- experiments
+    def _code_id(self, rem: Remote) -> str | None:
+        """What identifies the code on the box: finished jobs are only skipped while this is unchanged."""
+        p = rem.run(f"cat {q(rem.rt + '/provenance.json')}", check=False, cwd=None, timeout=60)
+        try:
+            prov = json.loads(p.stdout)
+        except ValueError:
+            return None
+        return prov.get("content_sha256") or prov.get("git_sha")
+
+    def _live_runners(self, rem: Remote) -> list[str]:
+        """Experiments whose job runner has a fresh heartbeat."""
+        out = rem.text(f'now=$(date +%s); for f in {q(rem.ws + "/jobs")}/*.heartbeat; do [ -f "$f" ] && '
+                       'echo "$(( now - $(stat -c %Y "$f") )) $f"; done; true', check=False, cwd=None, timeout=60)
+        live = []
+        for line in out.splitlines():
+            age, _, path = line.partition(" ")
+            if age.lstrip("-").isdigit() and int(age) < self.runner_stale_s:
+                live.append(posixpath.basename(path).removesuffix(".heartbeat"))
+        return live
+
     def start_exp(self, rem: Remote, exp_file: str, sha: str | None) -> str:
         spec = expand(exp_file, self.proj.cfg["results"]["remote_dir"])
-        spec.update(git_sha=sha, project_dir=rem.proj, env_file=rem.env_file, logs_dir=f"{rem.ws}/logs", shell=self.shell)
+        others = [e for e in self._live_runners(rem) if e != spec["exp"]]
+        if others:
+            raise RuntimeError(f"experiment(s) {others} still running on this instance; jobs must not share the GPU. "
+                               "Wait for them to finish first (`gpuhop status`).")
+        self.install_runtime(rem)  # a reused instance may have an older runner
+        self._tokens[spec["exp"]] = uuid.uuid4().hex
+        spec.update(git_sha=sha, project_dir=rem.proj, env_file=rem.env_file, logs_dir=f"{rem.ws}/logs", shell=self.shell,
+                    token=self._tokens[spec["exp"]], code_id=self._code_id(rem))
         remote_file = f"{rem.ws}/jobs/{spec['exp']}.json"
         rem.put_text(remote_file, json.dumps(spec, indent=2))
+        rem.run(f"rm -f {q(rem.ws + '/jobs/' + spec['exp'] + '.heartbeat')}", cwd=None)
         rem.detach(self._session_name(spec["exp"]),
                    f"{q(self.proj.cfg['python'])} {q(rem.rt + '/jobrunner.py')} {q(remote_file)}",
                    f"{rem.ws}/logs/{spec['exp']}.runner.log")
@@ -355,14 +439,35 @@ class Launcher:
             if j["state"] == "failed":
                 print(f"    FAILED {n} (rc={j.get('returncode')}) -> gpuhop logs --job {st['exp']}/{n}")
 
+    def _runner_dead(self, rem: Remote, exp: str, since: float) -> bool:
+        """True only on positive evidence: the box answered and the heartbeat is stale, or never appeared."""
+        hb = q(f"{rem.ws}/jobs/{exp}.heartbeat")
+        try:
+            p = rem.run(f'if [ -f {hb} ]; then echo $(( $(date +%s) - $(stat -c %Y {hb}) )); else echo missing; fi',
+                        check=False, cwd=None, timeout=60)
+        except Exception:
+            return False
+        out = p.stdout.decode(errors="replace").strip() if p.returncode == 0 else ""
+        if out == "missing":
+            return time.time() - since > self.runner_stale_s
+        return out.lstrip("-").isdigit() and int(out) > self.runner_stale_s
+
     def wait_exp(self, rem: Remote, exp: str, deadline: float | None = None, inst_id: int | None = None) -> dict:
         """Poll the job runner's status file. When ssh fails, look at the instance itself: a stopped instance is
-        reported (once) instead of polled silently, and after a restart the ssh endpoint is refreshed."""
+        reported (once) instead of polled silently, and after a restart the ssh endpoint is refreshed. A runner
+        that died raises RunnerDied instead of being waited on until the deadline."""
         last = None
         last_state = "running"
+        token = self._tokens.get(exp)
+        since = time.time()
+
+        def read():  # a status file left by an earlier run of this experiment does not count
+            s = self.exp_status(rem, exp)
+            return s if s and (not token or s.get("token") == token) else None
+
         while True:
             try:
-                st = self.exp_status(rem, exp)
+                st = read()
             except Exception as e:
                 print(f"  (status poll failed: {e}; retrying)")
                 st = None
@@ -375,8 +480,7 @@ class Launcher:
                 if state != last_state:
                     if state == "running":
                         rem = self.remote(inst)  # ports can change across a stop/start
-                        print(f"  instance {inst_id} is running again. Its job runner did not survive the restart; resume "
-                              f"with:  gpuhop run <exp file> --id {inst_id}   (finished jobs are skipped)", flush=True)
+                        print(f"  instance {inst_id} is running again; checking its job runner", flush=True)
                     else:
                         print(f"  WARNING: instance {inst_id} is '{state}' (intended: {inst.get('intended_status')}). Jobs "
                               f"are paused and nothing can be pulled. Restart it: gpuhop start {inst_id}. Do NOT Ctrl-C "
@@ -389,6 +493,17 @@ class Launcher:
                     last = key
                 if st["state"] in ("done", "failed"):
                     return st
+            if self._runner_dead(rem, exp, since):
+                try:  # it may have finished between the status read and the heartbeat check
+                    final = read()
+                except Exception:
+                    final = None
+                if final and final["state"] in ("done", "failed"):
+                    self.print_status(final)
+                    return final
+                raise RunnerDied(f"the job runner for {exp} is no longer running (host restart, out of memory or disk?)."
+                                 f" See logs/{exp}.runner.log on the box. Resume with: gpuhop run <exp file>"
+                                 + (f" --id {inst_id}" if inst_id is not None else "") + " (finished jobs are skipped)")
             if deadline and time.time() > deadline:
                 raise TimeoutError("max-hours reached")
             time.sleep(self.poll_exp_s)
@@ -403,7 +518,8 @@ class Launcher:
         for f in ("smoke.json", "provenance.json"):
             rem.pull_file(f"{rem.rt}/{f}", meta / f)
         meta.mkdir(parents=True, exist_ok=True)
-        (meta / "instance.json").write_text(json.dumps(redact(inst.get("raw", inst)), indent=2, default=str))
+        (meta / "instance.json").write_text(json.dumps(redact(inst.get("raw", inst)), indent=2, default=str),
+                                            encoding="utf-8")
         print(f"pulled -> {dest}" + ("" if got else " (no results yet)"), flush=True)
         return dest
 
@@ -433,17 +549,19 @@ class Launcher:
         inst_id = None
         created: list = []
         code = 1
+        had_work = False
         deadline = time.time() + float(max_hours or self.proj.cfg["max_hours"]) * 3600
         try:
             if instance:
                 inst_id, inst, rem = self.get(instance)
             else:
-                inst_id, inst, rem = self.up_with_retry(gpu, offer_id, allow_dirty, created)
+                inst_id, inst, rem = self.up_with_retry(  # a kept instance is meant to outlive the session
+                    gpu, offer_id, allow_dirty, created, failsafe_at=None if keep else deadline + self.failsafe_grace_s)
             sha = self.state.get(inst_id).get("git_sha")
             failed = False
             for f in exp_files:
-                exp = self.start_exp(rem, f, sha)
-                st = self.wait_exp(rem, exp, deadline=deadline, inst_id=inst_id)
+                had_work = True
+                exp, st, inst, rem = self._run_exp(inst_id, inst, rem, f, sha, deadline)
                 failed |= st["state"] == "failed"
                 self.pull(inst_id, inst, rem)  # after every exp, so nothing is lost if a later one hangs
                 if st["state"] == "failed" and expand(f, self.proj.cfg["results"]["remote_dir"]).get("stop_session_on_fail"):
@@ -457,37 +575,120 @@ class Launcher:
         finally:
             inst_id = inst_id if inst_id is not None else (created[-1] if created else None)
             if inst_id is not None:
-                self._finish(inst_id, keep=keep or bool(instance))
+                if not self._finish(inst_id, keep=keep or bool(instance), had_work=had_work):
+                    code = code or 1
         return code
 
-    def _finish(self, inst_id: int, keep: bool):
-        pulled, state = False, "unknown"
-        try:
-            inst = self.provider.show(inst_id)
-            state = (inst or {}).get("status") or "gone"
-            if inst and state == "running":
-                self.pull(inst_id, inst, self.remote(inst))
-                pulled = True
+    def _run_exp(self, inst_id: int, inst: dict, rem: Remote, exp_file: str, sha: str | None, deadline: float):
+        """Start one experiment and wait for it, restarting a runner that died (finished jobs are skipped)."""
+        exp = self.start_exp(rem, exp_file, sha)
+        for restarts_left in (2, 1, 0):
+            try:
+                st = self.wait_exp(rem, exp, deadline=deadline, inst_id=inst_id)
+                break
+            except RunnerDied as e:
+                if not restarts_left:
+                    raise
+                print(f"  {e}\n  restarting it ({restarts_left} restart(s) left)", flush=True)
+                inst = self.provider.show(inst_id) or inst
+                rem = self.remote(inst)
+                self.start_exp(rem, exp_file, sha)
+        try:  # ports can change across a stop/start
+            inst = self.provider.show(inst_id) or inst
+            rem = self.remote(inst)
         except Exception as e:
-            print(f"final pull failed: {e}")
+            print(f"  (could not refresh the instance: {e})")
+        return exp, st, inst, rem
+
+    def _destroy_safely(self, inst_id: int) -> bool:
+        """Destroy with retries, not interruptible by Ctrl-C. False (and a loud message) if it still failed."""
+        restore, old = False, None
+        try:
+            old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            restore = True
+        except ValueError:  # not the main thread
+            pass
+        try:
+            err = None
+            for attempt in range(3):
+                if attempt:
+                    time.sleep(min(self.poll_running_s, 5))
+                try:
+                    self.destroy(inst_id)
+                    return True
+                except Exception as e:
+                    err = e
+            print(f"ERROR: could not destroy instance {inst_id}: {err}\n  IT MAY STILL BE BILLING. "
+                  f"Run: gpuhop down {inst_id} -y   (and check `gpuhop ls`)", flush=True)
+            return False
+        finally:
+            if restore:
+                signal.signal(signal.SIGINT, old if old is not None else signal.SIG_DFL)
+
+    def _final_pull(self, inst_id: int, inst: dict) -> tuple[bool, bool]:
+        """(pulled, abandoned). Pressing Ctrl-C twice here is the explicit way to give up on the results."""
+        warned = False
+        for attempt in range(3):
+            try:
+                if attempt:
+                    time.sleep(min(self.poll_ready_s, 5))
+                self.pull(inst_id, inst, self.remote(inst))
+                return True, False
+            except KeyboardInterrupt:
+                if warned:
+                    print("\nabandoning the final pull", flush=True)
+                    return False, True
+                warned = True
+                print("\nstill pulling results. Press Ctrl-C again to abandon them and destroy the instance.", flush=True)
+            except Exception as e:
+                print(f"final pull failed (attempt {attempt + 1}/3): {e}", flush=True)
+        return False, False
+
+    def _finish(self, inst_id: int, keep: bool, had_work: bool = True) -> bool:
+        """Final pull, then destroy unless that could lose results. False if an instance was left up unintentionally."""
+        inst, state = None, "unknown"
+        for attempt in range(3):
+            try:
+                if attempt:
+                    time.sleep(min(self.poll_running_s, 5))
+                inst = self.provider.show(inst_id)
+                state = "gone" if inst is None else inst.get("status") or "unknown"
+                break
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"could not read instance {inst_id} (attempt {attempt + 1}/3): {e}", flush=True)
+        pulled, abandoned = self._final_pull(inst_id, inst) if inst and state == "running" else (False, False)
         if keep:
             print(f"keeping instance {inst_id} (remember `gpuhop down {inst_id}`)")
-        elif not pulled and state not in ("gone", "created", "loading", "unknown"):
-            # a stopped instance still holds unpulled results on its disk: never destroy it automatically
-            print(f"NOT destroying instance {inst_id}: it is '{state}' and its results could not be pulled.\n"
-                  f"  1) gpuhop start {inst_id}   2) gpuhop wait {inst_id}\n"
-                  f"  3) gpuhop pull {inst_id}    4) gpuhop down {inst_id} -y")
-        else:
-            self.destroy(inst_id)
+            return True
+        if state == "gone":
+            print(f"instance {inst_id} no longer exists")
+            self.state.forget(inst_id)
+            return True
+        if pulled or abandoned or not had_work:
+            return self._destroy_safely(inst_id)
+        # its disk may hold results we do not have: never destroy it automatically
+        steps = (f"  1) gpuhop pull {inst_id}    2) gpuhop down {inst_id} -y" if state == "running" else
+                 f"  1) gpuhop start {inst_id}   2) gpuhop wait {inst_id}\n"
+                 f"  3) gpuhop pull {inst_id}    4) gpuhop down {inst_id} -y")
+        armed = self.state.get(inst_id).get("failsafe_at")
+        note = (f" The failsafe stops it after {_utc(armed)} (GPU billing ends then; storage continues)." if armed
+                else "")
+        print(f"NOT destroying instance {inst_id}: it is '{state}' and its results could not be pulled. "
+              f"IT MAY STILL BE BILLING.{note}\n{steps}", flush=True)
+        return False
 
     def smoke(self, gpu: str, offer_id=None, allow_dirty=False, keep=False) -> int:
         """Boot + bootstrap (incl. the project's smoke command) on a GPU class, pull the report, destroy."""
         created: list = []
         code = 1
         try:
-            inst_id, inst, rem = self.up_with_retry(gpu, offer_id, allow_dirty, created)
+            failsafe_at = None if keep else time.time() + float(self.proj.cfg["max_hours"]) * 3600 + self.failsafe_grace_s
+            inst_id, inst, rem = self.up_with_retry(gpu, offer_id, allow_dirty, created, failsafe_at=failsafe_at)
             meta = self.pull(inst_id, inst, rem) / "_instance" / str(inst_id)
-            print((meta / "smoke.json").read_text() if (meta / "smoke.json").exists() else "bootstrap OK (no smoke report)")
+            print((meta / "smoke.json").read_text(encoding="utf-8", errors="replace") if (meta / "smoke.json").exists()
+                  else "bootstrap OK (no smoke report)")
             code = 0
         except KeyboardInterrupt:
             print("\ninterrupted")
@@ -495,5 +696,5 @@ class Launcher:
             print(f"SMOKE FAILED on {gpu}: {e}")
         finally:
             if created:
-                self._finish(created[-1], keep=keep)
+                self._finish(created[-1], keep=keep, had_work=False)  # a smoke run produces no results to protect
         return code

@@ -15,6 +15,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import shlex
 import socket
 import subprocess
@@ -26,10 +27,12 @@ from pathlib import Path
 from .project import Project, env
 
 # Never shipped, whatever .gitignore says.
-ALWAYS_EXCLUDE = [".env", ".env.*", ".gpuhop", ".gpuhop/*", ".git", ".git/*"]
+ALWAYS_EXCLUDE = [".env*", ".gpuhop", ".gpuhop/*", ".git", ".git/*"]
 WALK_SKIP_DIRS = {".git", ".gpuhop", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache", ".ruff_cache",
                   "node_modules"}
 WARN_MB = 200
+# Gives git the token from the environment, so it is never in a command line, a URL or an error message.
+CRED_HELPER = '!f() { echo username=x-access-token; echo "password=$GPUHOP_GH_TOKEN"; }; f'
 
 
 def _git(root: Path, *args, check: bool = True) -> str:
@@ -52,15 +55,34 @@ def _excluded(rel: str, patterns: list[str]) -> bool:
     return False
 
 
+def _git_files(root: Path, prefix: str = "") -> set[str]:
+    """Tracked + untracked-not-ignored files, descending into submodules (which git lists as a single directory)."""
+    out = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=root, capture_output=True,
+                         check=True).stdout.decode()
+    files: set[str] = set()
+    for f in out.split("\0"):
+        f = f.rstrip("/")
+        if not f:
+            continue
+        path = root / f
+        if path.is_file():  # drops deleted-but-tracked files
+            files.add(prefix + f)
+        elif path.is_dir():
+            if (path / ".git").exists():
+                files |= _git_files(path, f"{prefix}{f}/")
+            else:
+                print(f"warning: submodule {prefix}{f} is not initialised, so it is not shipped "
+                      "(git submodule update --init)")
+    return files
+
+
 def list_files(proj: Project) -> list[str]:
     """Project-relative posix paths that would be shipped."""
     root = proj.root
     patterns = ALWAYS_EXCLUDE + list(proj.cfg["code"].get("exclude") or [])
-    results = proj.cfg["results"]["local_dir"].strip("/") + "/"  # pulled results never go back up
+    results = posixpath.normpath(proj.cfg["results"]["local_dir"]) + "/"  # pulled results never go back up
     if is_git(root):
-        out = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=root, capture_output=True,
-                             check=True).stdout.decode()
-        files = sorted({f for f in out.split("\0") if f and (root / f).is_file()})  # drops deleted-but-tracked files
+        files = sorted(_git_files(root))
     else:
         files = []
         for d, dirs, names in os.walk(root):
@@ -128,8 +150,9 @@ class CodePackage:
         return f"tarball of {len(self.files)} files{sha}"
 
     def build(self) -> Path:
-        """Write the tarball (tarball mode). Files are added in sorted order with fixed mtimes, so the
-        tarball's hash depends only on paths + contents.
+        """Write the tarball (tarball mode). `content_sha256` depends only on paths + contents. Files get the push
+        time as mtime: Python decides whether a .pyc is stale from the source's mtime and size, so a fixed mtime
+        would keep old bytecode alive after a same-size edit.
 
         Shell scripts get LF line endings: a Windows checkout (core.autocrlf) has CRLF, which bash on the box
         rejects (`set: pipefail\\r: invalid option`)."""
@@ -138,6 +161,7 @@ class CodePackage:
         fd, name = tempfile.mkstemp(suffix=".tar.gz", prefix="gpuhop-code-")
         os.close(fd)
         h = hashlib.sha256()
+        now = int(time.time())
         with tarfile.open(name, "w:gz") as tf:
             for rel in self.files:
                 data = (self.proj.root / rel).read_bytes()
@@ -146,7 +170,7 @@ class CodePackage:
                     data = data.replace(b"\r\n", b"\n")
                 h.update(rel.encode() + b"\0" + hashlib.sha256(data).digest())
                 ti = tarfile.TarInfo(rel)
-                ti.size, ti.mtime = len(data), 0
+                ti.size, ti.mtime = len(data), now
                 ti.mode = 0o755 if script or (os.name != "nt" and os.access(self.proj.root / rel, os.X_OK)) else 0o644
                 tf.addfile(ti, io.BytesIO(data))
         self.provenance["content_sha256"] = h.hexdigest()
@@ -175,6 +199,8 @@ class CodePackage:
             finally:
                 self.cleanup()
             if old.returncode == 0:
+                # two pushes within a second share an mtime, so bytecode from the previous push must go
+                rem.run(f"find {shlex.quote(rem.proj)} -type d -name __pycache__ -prune -exec rm -rf {{}} +", cwd=None)
                 stale = sorted(set(old.stdout.decode(errors="replace").splitlines()) - set(self.files))
                 if stale:
                     rem.run("cd " + shlex.quote(rem.proj) + " && rm -f -- " + " ".join(shlex.quote(s) for s in stale), cwd=None)
@@ -184,10 +210,13 @@ class CodePackage:
 
     def _push_git(self, rem):
         tok = env("GH_TOKEN")
-        url = f"https://x-access-token:{tok}@github.com/{self.git['repo']}.git"
         clean = f"https://github.com/{self.git['repo']}.git"
-        p, q = shlex.quote(rem.proj), shlex.quote(url)
-        rem.run("command -v git >/dev/null || (apt-get update -qq && apt-get install -y -qq git ca-certificates >/dev/null); "
-                f"if [ -d {p}/.git ]; then git -C {p} fetch -q {q} '+refs/heads/*:refs/remotes/origin/*'; "
-                f"else rm -rf {p} && git clone -q {q} {p} && git -C {p} remote set-url origin {shlex.quote(clean)}; fi && "
-                f"git -C {p} checkout -q {self.sha}", cwd=None)
+        p, q = shlex.quote(rem.proj), shlex.quote(clean)
+        g = f"git -c credential.helper= -c credential.helper={shlex.quote(CRED_HELPER)}"
+        # The token travels over ssh stdin and lives only in this shell's environment.
+        rem.run("IFS= read -r GPUHOP_GH_TOKEN; export GPUHOP_GH_TOKEN GIT_TERMINAL_PROMPT=0; "
+                "command -v git >/dev/null || (apt-get update -qq </dev/null && "
+                "apt-get install -y -qq git ca-certificates </dev/null >/dev/null); "
+                f"if [ -d {p}/.git ]; then {g} -C {p} fetch -q {q} '+refs/heads/*:refs/remotes/origin/*'; "
+                f"else rm -rf {p} && {g} clone -q {q} {p}; fi && "
+                f"git -C {p} checkout -q {self.sha}", input=f"{tok}\n", cwd=None)

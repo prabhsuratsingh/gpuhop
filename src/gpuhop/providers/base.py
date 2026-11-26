@@ -45,6 +45,20 @@ class Provider(ABC):
         """Public keys registered on the account (None: the provider does not manage keys)."""
         return None
 
+    # -- failsafe: a stop that the provider's servers carry out, so it happens even if the laptop is gone ------
+    def schedule_stop(self, inst_id: int, at: float) -> str | int | None:
+        """Ask the provider to stop the instance at (or soon after) `at`, repeating until it is stopped.
+        Returns the scheduled job's id, or None when the provider cannot do this."""
+        return None
+
+    def cancel_scheduled_stops(self, inst_id: int) -> int:
+        """Delete the scheduled stops for one instance; returns how many were deleted."""
+        return 0
+
+    def scheduled_stops(self) -> list[dict]:
+        """Every scheduled stop on the account: [{"id", "instance_id", "start_time"}]."""
+        return []
+
     def check(self) -> str:
         """Cheap authenticated call for `doctor`; returns a one-line status."""
         return f"{len(self.list())} instance(s) on the account"

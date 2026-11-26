@@ -63,10 +63,11 @@ def _check_ssh_key(registered_keys: list[str]) -> str:
     registered = {k.split()[1] for k in registered_keys if len(k.split()) > 1}
     own = env("SSH_KEY")
     if own:
+        own = os.path.expanduser(own)
         pub = Path(own + ".pub")
         if not Path(own).exists() or not pub.exists():
             raise RuntimeError(f"GPUB_SSH_KEY={own}: private key or {pub.name} not found")
-        if pub.read_text().split()[1] not in registered:
+        if pub.read_text(encoding="utf-8").split()[1] not in registered:
             raise RuntimeError(f"{pub} is not registered with the provider (Vast: cloud.vast.ai/manage-keys)")
         return f"{Path(own).name} (GPUB_SSH_KEY) is registered"
     # Without GPUB_SSH_KEY, OpenSSH only offers its default key names.
@@ -142,7 +143,7 @@ def cmd_offers(a):
     print(f"{'offer':>10} {'gpu':<10} {'$/hr':>6} {'rel':>5} {'cuda':>5} {'down':>6} {'cores':>5} {'driver':>10}  {'cpu':<38} location")
     for o in offers:
         cpu = (o["cpu_name"] or "?").replace(" Processor", "").replace("-Core", "c")[:38]
-        print(f"{o['id']:>10} {o['gpu_name']:<10} {o['dph'] or 0:>6.3f} {o['reliability'] or 0:>5.3f} {o['cuda']!s:>5} "
+        print(f"{o['id']:>10} {o['gpu_name'] or '?':<10} {o['dph'] or 0:>6.3f} {o['reliability'] or 0:>5.3f} {o['cuda']!s:>5} "
               f"{o['inet_down'] or 0:>6.0f} {o['cpu_cores'] or 0:>5.0f} {o.get('driver') or '?':>10}  {cpu:<38} {o['location']}")
     if not offers:
         print(f"no offers match: {catalog.gpu_spec(lx.proj, a.gpu)['query']}")
@@ -151,7 +152,14 @@ def cmd_offers(a):
 
 def cmd_up(a):
     lx = _launcher()
-    inst_id, _, _ = lx.up(a.gpu, a.offer, a.allow_dirty, wait=not a.no_wait)
+    created: list = []
+    try:
+        inst_id, _, _ = lx.up_with_retry(a.gpu, a.offer, a.allow_dirty, created, wait=not a.no_wait)
+    except BaseException:
+        if created:
+            print(f"instance {created[-1]} is still up for debugging: gpuhop logs {created[-1]} --bootstrap, "
+                  f"then gpuhop down {created[-1]} -y")
+        raise
     print(f"{'bootstrapping (gpuhop wait)' if a.no_wait else 'ready'}: gpuhop ssh {inst_id}")
     return 0
 
@@ -174,11 +182,35 @@ def cmd_ls(a):
     for r in rows:
         age = (time.time() - (r.get("start_date") or time.time())) / 3600
         tag = "this project" if str(r["id"]) in local else "other"
-        print(f"{r['id']:>10}  {r['gpu_name']:<12} {r['status']:<9} ${r['dph'] or 0:.3f}/hr  {age:5.2f} h  "
+        armed = (local.get(str(r["id"])) or {}).get("failsafe_at")
+        if armed and time.time() > armed and r["status"] != "running":
+            tag += f"; stopped by the failsafe, results may be on its disk: gpuhop start {r['id']}, wait, pull, down"
+        print(f"{r['id']:>10}  {r['gpu_name'] or '?':<12} {r['status']:<9} ${r['dph'] or 0:.3f}/hr  {age:5.2f} h  "
               f"~${age * (r['dph'] or 0):.2f}  label={r.get('label')}  [{tag}]")
     for s in set(local) - {str(r["id"]) for r in rows}:
-        lx.state.forget(int(s))
+        try:  # a list that merely omits it (API hiccup) must not make us forget a live, billing instance
+            if lx.provider.show(int(s)) is None:
+                lx.state.forget(int(s))
+        except Exception as e:
+            print(f"could not check instance {s}: {e}")
+    _clean_scheduled_stops(lx, {r["id"] for r in rows})
     return 0
+
+
+def _clean_scheduled_stops(lx, listed: set):
+    """Scheduled stops outlive their instance (Vast keeps them): delete the ones whose instance is gone."""
+    try:
+        stops = lx.provider.scheduled_stops()
+    except Exception as e:
+        print(f"could not list scheduled stops: {e}")
+        return
+    for iid in sorted({j["instance_id"] for j in stops} - {int(i) for i in listed}):
+        try:
+            if lx.provider.show(iid) is None:
+                lx.provider.cancel_scheduled_stops(iid)
+                print(f"deleted the leftover scheduled stop of destroyed instance {iid}")
+        except Exception as e:
+            print(f"could not clean the scheduled stop of instance {iid}: {e}")
 
 
 def cmd_show(a):
@@ -199,7 +231,11 @@ def cmd_sync(a):
 
 def cmd_wait(a):
     lx = _launcher()
-    inst_id, inst, rem = lx.get(a.id)
+    inst_id = lx.state.resolve(a.id)
+    if not lx.provider.show(inst_id):
+        raise SystemExit(f"instance {inst_id} not found on {lx.provider.name} (destroyed?). `gpuhop ls`")
+    inst = lx.wait_running(inst_id, restarting=True)  # right after `gpuhop start` it has no ssh endpoint yet
+    rem = lx.connect(inst_id, inst)
     lx.write_env(rem, inst_id, inst)
     lx.wait_ready(rem, inst_id)
     print(f"ready: gpuhop ssh {inst_id}")
@@ -221,6 +257,7 @@ def cmd_rebootstrap(a):
 def cmd_start(a):
     lx = _launcher()
     inst_id = lx.state.resolve(a.id)
+    lx.disarm_failsafe(inst_id)  # otherwise the scheduled stop stops it again at the next full hour
     print(lx.provider.start(inst_id))
     print(f"starting {inst_id}; then: gpuhop wait {inst_id}")
     return 0
@@ -302,11 +339,11 @@ def cmd_freeze(a):
     lock = sorted((l for l in now if l.lower() not in base and l.split("==")[0].lower() not in BASE_SKIP), key=str.lower)
     out = lx.proj.root / lx.proj.cfg["lockfile"]
     # keep the index options of the previous lock (e.g. --extra-index-url https://pypi.nvidia.com)
-    index = [l for l in (out.read_text().splitlines() if out.exists() else []) if l.startswith("--")]
+    index = [l for l in (out.read_text(encoding="utf-8").splitlines() if out.exists() else []) if l.startswith("--")]
     index += [f"--extra-index-url {u}" for u in a.extra_index_url if f"--extra-index-url {u}" not in index]
     header = ["# AUTO-GENERATED by `gpuhop freeze` from a working instance. Do not edit by hand.",
               f"# base image packages are excluded (pinned by the image); generated {time.strftime('%Y-%m-%d')}"]
-    out.write_text("\n".join(header + index + lock) + "\n")
+    out.write_text("\n".join(header + index + lock) + "\n", encoding="utf-8")
     print(f"wrote {out} ({len(lock)} packages). Commit it and install from it in your setup script.")
     return 0
 
@@ -397,7 +434,16 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _safe_stdio():
+    """Remote logs contain arbitrary Unicode. On a redirected Windows stdout (cp1252) printing it must not crash a
+    session that is paying for a GPU."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main(argv=None):
+    _safe_stdio()
     a = build_parser().parse_args(argv)
     if getattr(a, "cpu", None):
         os.environ["GPUB_CPU_REGEX"] = a.cpu
@@ -408,6 +454,9 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("\ninterrupted")
         return 130
+    except (RuntimeError, TimeoutError) as e:
+        print(f"ERROR: {e}")
+        return 1
 
 
 if __name__ == "__main__":
