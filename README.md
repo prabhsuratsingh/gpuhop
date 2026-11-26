@@ -5,16 +5,36 @@ matching GPU, pushes your code, sets up the box, runs your jobs one by one, and 
 back into your project. Then it destroys the instance, including when a job fails or you press Ctrl-C.
 
 ```
-pip install gpuhop
-gpuhop init                      # scaffold: gpuhop.yaml, setup.sh, smoke.py, train.py, exp/*.yaml
-cp .env.example .env                # set VAST_API_KEY
+git clone https://github.com/prabhsuratsingh/gpuhop.git
+cd gpuhop && pip install -e . && cd ..
+
+gpuhop init my-project           # scaffold: gpuhop.yaml, setup.sh, smoke.py, train.py, exp/*.yaml
+cd my-project
+cp .env.example .env             # set VAST_API_KEY
 gpuhop doctor
 gpuhop exp rtx4090 exp/smoke.yaml
 ls results/rtx4090/smoke/
 ```
 
-It works from Windows, macOS and Linux. It needs only Python ≥ 3.10 and the OpenSSH client, which Windows 10+
-ships with. No rsync, Docker or GitHub account is required.
+It works from Windows, macOS and Linux. It needs only Python ≥ 3.10, git and the OpenSSH client, which Windows
+10+ ships with. No rsync, Docker or GitHub account is required.
+
+## Installing
+
+gpuhop is not on PyPI. Install it from this repository:
+
+- **From a clone** (shown above). Run `git pull` in the clone to update. Since it is an editable install, the
+  update takes effect right away. Using a virtual environment keeps gpuhop's dependencies away from your other
+  projects. To pin a release, run `git checkout v0.1.0` in the clone.
+- **One command, isolated**: if you only want the `gpuhop` command, install it as a tool in its own
+  environment, with [uv](https://docs.astral.sh/uv/) or [pipx](https://pipx.pypa.io/):
+
+  ```
+  uv tool install git+https://github.com/prabhsuratsingh/gpuhop.git
+  pipx install git+https://github.com/prabhsuratsingh/gpuhop.git        # same thing with pipx
+  ```
+
+  Append `@v0.1.0` to the URL to pin a release. Update with `uv tool upgrade gpuhop` or `pipx upgrade gpuhop`.
 
 ## What one `exp` does
 
